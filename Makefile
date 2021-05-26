@@ -32,8 +32,6 @@ export PATH:=$(GOBIN):$(PATH)
 KIND_KUBECONFIG:=.cache/e2e/kubeconfig
 export KUBECONFIG?=$(abspath $(KIND_KUBECONFIG))
 export GOLANGCI_LINT_CACHE=$(abspath .cache/golangci-lint)
-API_BASE:=reference.addons.managed.openshift.io
-export SKIP_TEARDOWN?=
 
 # Container
 IMAGE_ORG?=quay.io/app-sre
@@ -48,7 +46,7 @@ all: \
 
 bin/linux_amd64/%: GOARGS = GOOS=linux GOARCH=amd64
 
-bin/%: generate manifests FORCE
+bin/%: generate FORCE
 	$(eval COMPONENT=$(shell basename $*))
 	@echo -e -n "compiling cmd/$(COMPONENT)...\n  "
 	$(GOARGS) go build -ldflags "-w $(LD_FLAGS)" -o bin/$* cmd/$(COMPONENT)/main.go
@@ -151,11 +149,11 @@ dependencies: \
 .PHONY: dependencies
 
 # ----------
-# Deployment
+# Development
 # ----------
 
 # Run against the configured Kubernetes cluster in ~/.kube/config or $KUBECONFIG
-run: generate fmt vet manifests
+run: generate
 	go run -ldflags "-w $(LD_FLAGS)" \
 		./cmd/reference-addon-manager/main.go \
 			-pprof-addr="127.0.0.1:8065"
@@ -165,55 +163,31 @@ run: generate fmt vet manifests
 # Generators
 # ----------
 
-# Generate manifests e.g. CRD, RBAC etc.
-manifests: $(CONTROLLER_GEN)
+# Generate code and manifests e.g. CRD, RBAC etc.
+generate: $(CONTROLLER_GEN)
 	@echo "generating kubernetes manifests..."
 	@controller-gen crd:crdVersions=v1 \
 		rbac:roleName=reference-addon \
 		paths="./..." \
 		output:crd:artifacts:config=config/deploy 2>&1 | sed 's/^/  /'
 	@echo
-
-# Generate code
-generate: $(CONTROLLER_GEN)
 	@echo "generating code..."
 	@controller-gen object paths=./apis/... 2>&1 | sed 's/^/  /'
 	@echo
-
-# Makes sandwich
-# https://xkcd.com/149/
-sandwich:
-ifneq ($(shell id -u), 0)
-	@echo "What? Make it yourself."
-else
-	@echo "Okay."
-endif
 
 # -------------------
 # Testing and Linting
 # -------------------
 
-pre-commit-install: $(GOIMPORTS)
-	@echo "installing pre-commit hooks using https://pre-commit.com/"
-	@pre-commit install
-.PHONY: pre-commit-install
-
-fmt:
-	go fmt ./...
-.PHONY: fmt
-
-vet:
-	go vet ./...
-.PHONY: vet
-
 # Runs code-generators, checks for clean directory and lints the source code.
-lint: generate fmt vet manifests $(GOLANGCI_LINT)
-	@hack/validate-directory-clean.sh
+lint: generate $(GOLANGCI_LINT)
+	go fmt ./...
 	golangci-lint run ./... --deadline=15m
+	@hack/validate-directory-clean.sh
 .PHONY: lint
 
 # Runs unittests
-test-unit: generate fmt vet manifests
+test-unit: generate
 	CGO_ENABLED=1 go test -race -v ./internal/... ./cmd/...
 .PHONY: test-unit
 
@@ -232,7 +206,7 @@ test-e2e-local: | setup-e2e-kind test-e2e
 .PHONY: test-e2e-local
 
 # Run the E2E testsuite after installing the Reference Addon into the cluster.
-test-e2e-ci: | apply-ao test-e2e
+test-e2e-ci: | apply-reference-addon test-e2e
 
 # make sure that we install our components into the kind cluster and disregard normal $KUBECONFIG
 setup-e2e-kind: export KUBECONFIG=$(abspath $(KIND_KUBECONFIG))
@@ -243,28 +217,30 @@ setup-e2e-kind: | \
 create-kind-cluster: $(KIND)
 	@echo "creating kind cluster reference-addon-e2e..."
 	@mkdir -p .cache/e2e
-	@(source hack/determine-container-runtime.sh \
-		&& $$KIND_COMMAND create cluster \
-			--kubeconfig=$(KIND_KUBECONFIG) \
-			--name="reference-addon-e2e" \
-		&& sudo chown $$USER: $(KIND_KUBECONFIG) \
-		&& echo) 2>&1 | sed 's/^/  /'
+	@(source hack/determine-container-runtime.sh; \
+		$$KIND_COMMAND create cluster \
+			--kubeconfig="$(KIND_KUBECONFIG)" \
+			--name="reference-addon-e2e"; \
+		if [[ ! -O "$(KIND_KUBECONFIG)" ]]; then \
+			sudo chown $$USER: "$(KIND_KUBECONFIG)"; \
+		fi; \
+		echo) 2>&1 | sed 's/^/  /'
 .PHONY: create-kind-cluster
 
 delete-kind-cluster: $(KIND)
 	@echo "deleting kind cluster reference-addon-e2e..."
-	@(source hack/determine-container-runtime.sh \
-		&& $$KIND_COMMAND delete cluster \
+	@(source hack/determine-container-runtime.sh; \
+		$$KIND_COMMAND delete cluster \
 			--kubeconfig="$(KIND_KUBECONFIG)" \
-			--name "reference-addon-e2e" \
-		&& rm -rf "$(KIND_KUBECONFIG)" \
-		&& echo) 2>&1 | sed 's/^/  /'
+			--name "reference-addon-e2e"; \
+		rm -rf "$(KIND_KUBECONFIG)"; \
+		echo) 2>&1 | sed 's/^/  /'
 .PHONY: delete-kind-cluster
 
 # Load Addon Operator Image into kind
 load-reference-addon: build-image-reference-addon-manager
-	@source hack/determine-container-runtime.sh \
-		&& $$KIND_COMMAND load image-archive \
+	@source hack/determine-container-runtime.sh; \
+		$$KIND_COMMAND load image-archive \
 			.cache/image/reference-addon-manager.tar \
 			--name reference-addon-e2e
 .PHONY: load-reference-addon
@@ -272,23 +248,17 @@ load-reference-addon: build-image-reference-addon-manager
 # Template deployment
 config/deploy/deployment.yaml: FORCE $(YQ)
 	@yq eval '.spec.template.spec.containers[0].image = "$(REFERENCE_ADDON_MANAGER_IMAGE)"' \
-			config/deploy/deployment.yaml.tpl > config/deploy/deployment.yaml
+		config/deploy/deployment.yaml.tpl > config/deploy/deployment.yaml
 
 # Installs the Addon Operator into the kind e2e cluster.
 apply-reference-addon: $(YQ) load-reference-addon config/deploy/deployment.yaml
 	@echo "installing Addon Operator $(VERSION)..."
-	@(source hack/determine-container-runtime.sh \
-		&& kubectl apply -f config/deploy \
-		&& echo -e "\nwaiting for deployment/reference-addon..." \
-		&& kubectl wait --for=condition=available deployment/reference-addon -n reference-addon --timeout=240s \
-		&& echo) 2>&1 | sed 's/^/  /'
+	@(source hack/determine-container-runtime.sh; \
+		kubectl apply -f config/deploy; \
+		echo -e "\nwaiting for deployment/reference-addon..."; \
+		kubectl wait --for=condition=available deployment/reference-addon -n reference-addon --timeout=240s; \
+		echo) 2>&1 | sed 's/^/  /'
 .PHONY: apply-reference-addon
-
-apply-reference-addon-crds-only: manifests
-	@for file in $(shell find config -name '$(API_BASE)_*.yaml'); do \
-		kubectl apply -f "$$file"; \
-	done
-.PHONY: apply-reference-addon-crds-only
 
 # ----------------
 # Container Images
@@ -305,20 +275,20 @@ push-images: \
 .SECONDEXPANSION:
 build-image-%: bin/linux_amd64/$$*
 	@echo "building image ${IMAGE_ORG}/$*:${VERSION}..."
-	@(source hack/determine-container-runtime.sh \
-		&& rm -rf ".cache/image/$*" ".cache/image/$*.tar" \
-		&& mkdir -p ".cache/image/$*" \
-		&& cp -a "bin/linux_amd64/$*" ".cache/image/$*" \
-		&& cp -a "config/docker/$*.Dockerfile" ".cache/image/$*/Dockerfile" \
-		&& cp -a "config/docker/passwd" ".cache/image/$*/passwd" \
-		&& echo "building ${IMAGE_ORG}/$*:${VERSION}" \
-		&& $$CONTAINER_COMMAND build -t "${IMAGE_ORG}/$*:${VERSION}" ".cache/image/$*" \
-		&& $$CONTAINER_COMMAND image save -o ".cache/image/$*.tar" "${IMAGE_ORG}/$*:${VERSION}" \
-		&& echo) 2>&1 | sed 's/^/  /'
+	@(source hack/determine-container-runtime.sh; \
+		rm -rf ".cache/image/$*" ".cache/image/$*.tar"; \
+		mkdir -p ".cache/image/$*"; \
+		cp -a "bin/linux_amd64/$*" ".cache/image/$*"; \
+		cp -a "config/docker/$*.Dockerfile" ".cache/image/$*/Dockerfile"; \
+		cp -a "config/docker/passwd" ".cache/image/$*/passwd"; \
+		echo "building ${IMAGE_ORG}/$*:${VERSION}"; \
+		$$CONTAINER_COMMAND build -t "${IMAGE_ORG}/$*:${VERSION}" ".cache/image/$*"; \
+		$$CONTAINER_COMMAND image save -o ".cache/image/$*.tar" "${IMAGE_ORG}/$*:${VERSION}"; \
+		echo) 2>&1 | sed 's/^/  /'
 
 push-image-%: build-image-$$*
 	@echo "pushing image ${IMAGE_ORG}/$*:${VERSION}..."
-	@(source hack/determine-container-runtime.sh \
-		&& $$CONTAINER_COMMAND push "${IMAGE_ORG}/$*:${VERSION}" \
-		&& echo pushed "${IMAGE_ORG}/$*:${VERSION}" \
-		&& echo) 2>&1 | sed 's/^/  /'
+	@(source hack/determine-container-runtime.sh; \
+		$$CONTAINER_COMMAND push "${IMAGE_ORG}/$*:${VERSION}"; \
+		echo pushed "${IMAGE_ORG}/$*:${VERSION}"; \
+		echo) 2>&1 | sed 's/^/  /'
