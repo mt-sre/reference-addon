@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -15,6 +17,9 @@ import (
 
 	refapis "github.com/mt-sre/reference-addon/apis"
 	"github.com/mt-sre/reference-addon/internal/controllers"
+	"github.com/mt-sre/reference-addon/internal/utils"
+	addonsv1alpha1 "github.com/openshift/addon-operator/apis"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
@@ -25,6 +30,7 @@ var (
 func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = refapis.AddToScheme(scheme)
+	_ = addonsv1alpha1.AddToScheme(scheme)
 }
 
 func main() {
@@ -92,10 +98,52 @@ func main() {
 		}
 	}
 
+	// couple the heartbeat reporter with the manager
+
+	// TODO(ykukreja): heartbeatCommunicatorCh to be buffered channel instead, for better congestion control?
+	// already some congestion control happening vi the timeout defined under utils.CommunicateHeartbeat(...)
+	heartbeatCommunicatorCh := make(chan metav1.Condition)
+	err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		// no significance of having heartbeatCommunicatorCh open if this heartbeat reporter function is exited
+		defer close(heartbeatCommunicatorCh)
+
+		addonName := "reference-addon"
+		// initialized with a healthy heartbeat condition corresponding to Reference Addon
+		currentHeartbeatCondition := metav1.Condition{
+			Type:    "addons.managed.openshift.io/Healthy",
+			Status:  "True",
+			Reason:  "AllComponentsUp",
+			Message: "Everything under reference-addon is working perfectly fine",
+		}
+
+		// report a heartbeat at a 10-second rate (to be made tweakable)
+		for range time.Tick(10 * time.Second) {
+			select {
+			case latestHeartbeatCondition := <-heartbeatCommunicatorCh:
+				currentHeartbeatCondition = latestHeartbeatCondition
+				if err := utils.SetAddonInstanceCondition(ctx, mgr.GetClient(), currentHeartbeatCondition, addonName); err != nil {
+					mgr.GetLogger().Error(err, "error occurred while setting the condition", fmt.Sprintf("%+v", currentHeartbeatCondition))
+				} // coz 'fallthrough' isn't allowed under select-case :'(
+			case <-ctx.Done():
+				return nil
+			default:
+				if err := utils.SetAddonInstanceCondition(ctx, mgr.GetClient(), currentHeartbeatCondition, addonName); err != nil {
+					mgr.GetLogger().Error(err, "error occurred while setting the condition", fmt.Sprintf("%+v", currentHeartbeatCondition))
+				}
+			}
+		}
+		return nil
+	}))
+	if err != nil {
+		setupLog.Error(err, "unable to setup heartbeat reporter")
+		os.Exit(1)
+	}
+
 	if err = (&controllers.ReferenceAddonReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("ReferenceAddon"),
-		Scheme: mgr.GetScheme(),
+		Client:                       mgr.GetClient(),
+		Log:                          ctrl.Log.WithName("controllers").WithName("ReferenceAddon"),
+		Scheme:                       mgr.GetScheme(),
+		HeartbeatCommunicatorChannel: heartbeatCommunicatorCh,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ReferenceAddon")
 		os.Exit(1)
