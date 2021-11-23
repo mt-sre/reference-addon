@@ -14,7 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	refapis "github.com/mt-sre/reference-addon/apis"
-	// "github.com/mt-sre/reference-addon/internal/controllers"
+	"github.com/mt-sre/reference-addon/internal/controllers"
 )
 
 var (
@@ -92,14 +92,14 @@ func main() {
 		}
 	}
 
-	// if err = (&controllers.AddonReconciler{
-	// 	Client: mgr.GetClient(),
-	// 	Log:    ctrl.Log.WithName("controllers").WithName("Addon"),
-	// 	Scheme: mgr.GetScheme(),
-	// }).SetupWithManager(mgr); err != nil {
-	// 	setupLog.Error(err, "unable to create controller", "controller", "Addon")
-	// 	os.Exit(1)
-	// }
+	if err = (&controllers.ReferenceAddonReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("ReferenceAddon"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "ReferenceAddon")
+		os.Exit(1)
+	}
 
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
