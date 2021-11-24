@@ -18,7 +18,8 @@ import (
 	refapis "github.com/mt-sre/reference-addon/apis"
 	"github.com/mt-sre/reference-addon/internal/controllers"
 	"github.com/mt-sre/reference-addon/internal/utils"
-	addonsv1alpha1 "github.com/openshift/addon-operator/apis"
+	addonsv1apis "github.com/openshift/addon-operator/apis"
+	addonsv1alpha1 "github.com/openshift/addon-operator/apis/addons/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -30,7 +31,7 @@ var (
 func init() {
 	_ = clientgoscheme.AddToScheme(scheme)
 	_ = refapis.AddToScheme(scheme)
-	_ = addonsv1alpha1.AddToScheme(scheme)
+	_ = addonsv1apis.AddToScheme(scheme)
 }
 
 func main() {
@@ -103,9 +104,12 @@ func main() {
 	// TODO(ykukreja): heartbeatCommunicatorCh to be buffered channel instead, for better congestion control?
 	// already some congestion control happening vi the timeout defined under utils.CommunicateHeartbeat(...)
 	heartbeatCommunicatorCh := make(chan metav1.Condition)
+	configurationWatcherCh := make(chan bool)
 	err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		// no significance of having heartbeatCommunicatorCh open if this heartbeat reporter function is exited
 		defer close(heartbeatCommunicatorCh)
+
+		//TODO(ykukreja): Should the close(configurationWatcherCh) be deferred as well?
 
 		addonName := "reference-addon"
 		// initialized with a healthy heartbeat condition corresponding to Reference Addon
@@ -116,8 +120,13 @@ func main() {
 			Message: "Everything under reference-addon is working perfectly fine",
 		}
 
-		// report a heartbeat at a 10-second rate (to be made tweakable)
-		for range time.Tick(10 * time.Second) {
+		currentAddonInstanceConfiguration, err := utils.GetAddonInstanceConfiguration(ctx, mgr.GetClient(), addonName)
+		if err != nil {
+			return fmt.Errorf("failed to get the AddonInstance configuration corresponding to the Addon '%s': %w", addonName, err)
+		}
+
+		// Heartbeat reporter section: report a heartbeat at an interval ('currentAddonInstanceConfiguration.HeartbeatUpdatePeriod' seconds)
+		for {
 			select {
 			case latestHeartbeatCondition := <-heartbeatCommunicatorCh:
 				currentHeartbeatCondition = latestHeartbeatCondition
@@ -131,8 +140,23 @@ func main() {
 					mgr.GetLogger().Error(err, "error occurred while setting the condition", fmt.Sprintf("%+v", currentHeartbeatCondition))
 				}
 			}
+
+			// Watch for any configurational changes in the AddonInstance corresponding to reference-addon
+			select {
+			case <-configurationWatcherCh:
+				currentAddonInstanceConfiguration, err = utils.GetAddonInstanceConfiguration(ctx, mgr.GetClient(), addonName)
+				if err != nil {
+					return fmt.Errorf("failed to get the AddonInstance configuration corresponding to the Addon '%s': %w", addonName, err)
+				}
+				// the following function can be absolutely anything depending how reference-addon would want to deal with AddonInstance's configuration change
+				handleConfigurationChanges := func(addonsv1alpha1.AddonInstanceSpec) {}
+				handleConfigurationChanges(currentAddonInstanceConfiguration)
+			default:
+				// do nothing, just continue if no configuration change is observed
+			}
+			<-time.After(currentAddonInstanceConfiguration.HeartbeatUpdatePeriod.Duration)
+			fmt.Printf("\nDone waiting for: %+v", currentAddonInstanceConfiguration.HeartbeatUpdatePeriod.Duration)
 		}
-		return nil
 	}))
 	if err != nil {
 		setupLog.Error(err, "unable to setup heartbeat reporter")

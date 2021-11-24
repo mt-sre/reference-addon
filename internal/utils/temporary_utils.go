@@ -16,20 +16,12 @@ import (
 )
 
 func SetAddonInstanceCondition(ctx context.Context, cacheBackedKubeClient client.Client, condition metav1.Condition, addonName string) error {
-	addon := &addonsv1alpha1.Addon{}
-	if err := cacheBackedKubeClient.Get(ctx, types.NamespacedName{Name: addonName}, addon); err != nil {
-		return err
-	}
-	targetNamespace, err := parseTargetNamespaceFromAddon(*addon)
+	addonInstance, err := getAddonInstanceByAddon(ctx, cacheBackedKubeClient, addonName)
 	if err != nil {
-		return fmt.Errorf("failed to parse the target namespace from the Addon: %w", err)
+		return fmt.Errorf("failed to fetch AddonInstance by the addon '%s': %w", addonName, err)
 	}
-	addonInstance := &addonsv1alpha1.AddonInstance{}
-	if err := cacheBackedKubeClient.Get(ctx, types.NamespacedName{Name: addonsv1alpha1.DefaultAddonInstanceName, Namespace: targetNamespace}, addonInstance); err != nil {
-		return fmt.Errorf("failed to fetch the AddonInstance resource corresponding to the namespace %s: %w", targetNamespace, err)
-	}
-	if err := upsertAddonInstanceCondition(ctx, cacheBackedKubeClient, addonInstance, condition); err != nil {
-		return fmt.Errorf("failed to update the conditions of the AddonInstance resource corresponding to the namespace %s: %w", targetNamespace, err)
+	if err := upsertAddonInstanceCondition(ctx, cacheBackedKubeClient, &addonInstance, condition); err != nil {
+		return fmt.Errorf("failed to update the conditions of the AddonInstance resource in the namespace %s: %w", addonInstance.Namespace, err)
 	}
 	return nil
 }
@@ -44,6 +36,30 @@ func CommunicateHeartbeat(heartbeatCommunicatorChannel chan metav1.Condition, co
 			fmt.Println("heartbeat couldn't be sent due to it not being received by a receiver due to the channel being choked!") // just a placeholder message :P
 		}
 	}()
+}
+
+func GetAddonInstanceConfiguration(ctx context.Context, cacheBackedKubeClient client.Client, addonName string) (addonsv1alpha1.AddonInstanceSpec, error) {
+	addonInstance, err := getAddonInstanceByAddon(ctx, cacheBackedKubeClient, addonName)
+	if err != nil {
+		return addonsv1alpha1.AddonInstanceSpec{}, fmt.Errorf("failed to fetch AddonInstance by the addon '%s': %w", addonName, err)
+	}
+	return addonInstance.Spec, nil
+}
+
+func getAddonInstanceByAddon(ctx context.Context, cacheBackedKubeClient client.Client, addonName string) (addonsv1alpha1.AddonInstance, error) {
+	addon := &addonsv1alpha1.Addon{}
+	if err := cacheBackedKubeClient.Get(ctx, types.NamespacedName{Name: addonName}, addon); err != nil {
+		return addonsv1alpha1.AddonInstance{}, err
+	}
+	targetNamespace, err := parseTargetNamespaceFromAddon(*addon)
+	if err != nil {
+		return addonsv1alpha1.AddonInstance{}, fmt.Errorf("failed to parse the target namespace from the Addon: %w", err)
+	}
+	addonInstance := &addonsv1alpha1.AddonInstance{}
+	if err := cacheBackedKubeClient.Get(ctx, types.NamespacedName{Name: addonsv1alpha1.DefaultAddonInstanceName, Namespace: targetNamespace}, addonInstance); err != nil {
+		return addonsv1alpha1.AddonInstance{}, fmt.Errorf("failed to fetch the AddonInstance resource in the namespace %s: %w", targetNamespace, err)
+	}
+	return *addonInstance, nil
 }
 
 func parseTargetNamespaceFromAddon(addon addonsv1alpha1.Addon) (string, error) {
