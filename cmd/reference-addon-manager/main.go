@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"reflect"
 	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -104,12 +105,9 @@ func main() {
 	// TODO(ykukreja): heartbeatCommunicatorCh to be buffered channel instead, for better congestion control?
 	// already some congestion control happening vi the timeout defined under utils.CommunicateHeartbeat(...)
 	heartbeatCommunicatorCh := make(chan metav1.Condition)
-	configurationWatcherCh := make(chan bool)
 	err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		// no significance of having heartbeatCommunicatorCh open if this heartbeat reporter function is exited
 		defer close(heartbeatCommunicatorCh)
-
-		//TODO(ykukreja): Should the close(configurationWatcherCh) be deferred as well?
 
 		addonName := "reference-addon"
 		// initialized with a healthy heartbeat condition corresponding to Reference Addon
@@ -141,21 +139,21 @@ func main() {
 				}
 			}
 
-			// Watch for any configurational changes in the AddonInstance corresponding to reference-addon
-			select {
-			case <-configurationWatcherCh:
-				currentAddonInstanceConfiguration, err = utils.GetAddonInstanceConfiguration(ctx, mgr.GetClient(), addonName)
-				if err != nil {
-					return fmt.Errorf("failed to get the AddonInstance configuration corresponding to the Addon '%s': %w", addonName, err)
-				}
+			// checking latest addonInstance configuration and seeing if it differs with current AddonInstance configuration
+			latestAddonInstanceConfiguration, err := utils.GetAddonInstanceConfiguration(ctx, mgr.GetClient(), addonName)
+			if err != nil {
+				return fmt.Errorf("failed to get the AddonInstance configuration corresponding to the Addon '%s': %w", addonName, err)
+			}
+			if !reflect.DeepEqual(currentAddonInstanceConfiguration, latestAddonInstanceConfiguration) {
+				currentAddonInstanceConfiguration = latestAddonInstanceConfiguration
+
 				// the following function can be absolutely anything depending how reference-addon would want to deal with AddonInstance's configuration change
 				handleConfigurationChanges := func(addonsv1alpha1.AddonInstanceSpec) {}
 				handleConfigurationChanges(currentAddonInstanceConfiguration)
-			default:
-				// do nothing, just continue if no configuration change is observed
 			}
+
+			// waiting for heartbeat update period for executing the next iteration
 			<-time.After(currentAddonInstanceConfiguration.HeartbeatUpdatePeriod.Duration)
-			fmt.Printf("\nDone waiting for: %+v", currentAddonInstanceConfiguration.HeartbeatUpdatePeriod.Duration)
 		}
 	}))
 	if err != nil {
