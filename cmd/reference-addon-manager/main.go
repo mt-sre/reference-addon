@@ -7,8 +7,6 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"os"
-	"reflect"
-	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -21,7 +19,6 @@ import (
 	"github.com/mt-sre/reference-addon/internal/utils"
 	addonsv1apis "github.com/openshift/addon-operator/apis"
 	addonsv1alpha1 "github.com/openshift/addon-operator/apis/addons/v1alpha1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
@@ -100,72 +97,27 @@ func main() {
 		}
 	}
 
-	// couple the heartbeat reporter with the manager
+	// the following sectiom hooks up a heartbeat reporter with the current addon/operator
+	///////////////////////////////////////////////////// -------------------------------- /////////////////////////////////////////////////////
+	addonName := "reference-addon"
+	// the following 'handleAddonInstanceConfigurationChanges' function can be absolutely anything depending how reference-addon would want to deal with AddonInstance's configuration change
+	handleAddonInstanceConfigurationChanges := func(addonsv1alpha1.AddonInstanceSpec) {
+		fmt.Println("Handling AddonInstance's configuration changes, whooossh!!!")
+	}
 
-	// TODO(ykukreja): heartbeatCommunicatorCh to be buffered channel instead, for better congestion control?
-	// already some congestion control happening vi the timeout defined under utils.CommunicateHeartbeat(...)
-	heartbeatCommunicatorCh := make(chan metav1.Condition)
-	err = mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-		// no significance of having heartbeatCommunicatorCh open if this heartbeat reporter function is exited
-		defer close(heartbeatCommunicatorCh)
-
-		addonName := "reference-addon"
-		// initialized with a healthy heartbeat condition corresponding to Reference Addon
-		currentHeartbeatCondition := metav1.Condition{
-			Type:    "addons.managed.openshift.io/Healthy",
-			Status:  "True",
-			Reason:  "AllComponentsUp",
-			Message: "Everything under reference-addon is working perfectly fine",
-		}
-
-		currentAddonInstanceConfiguration, err := utils.GetAddonInstanceConfiguration(ctx, mgr.GetClient(), addonName)
-		if err != nil {
-			return fmt.Errorf("failed to get the AddonInstance configuration corresponding to the Addon '%s': %w", addonName, err)
-		}
-
-		// Heartbeat reporter section: report a heartbeat at an interval ('currentAddonInstanceConfiguration.HeartbeatUpdatePeriod' seconds)
-		for {
-			select {
-			case latestHeartbeatCondition := <-heartbeatCommunicatorCh:
-				currentHeartbeatCondition = latestHeartbeatCondition
-				if err := utils.SetAddonInstanceCondition(ctx, mgr.GetClient(), currentHeartbeatCondition, addonName); err != nil {
-					mgr.GetLogger().Error(err, "error occurred while setting the condition", fmt.Sprintf("%+v", currentHeartbeatCondition))
-				} // coz 'fallthrough' isn't allowed under select-case :'(
-			case <-ctx.Done():
-				return nil
-			default:
-				if err := utils.SetAddonInstanceCondition(ctx, mgr.GetClient(), currentHeartbeatCondition, addonName); err != nil {
-					mgr.GetLogger().Error(err, "error occurred while setting the condition", fmt.Sprintf("%+v", currentHeartbeatCondition))
-				}
-			}
-
-			// checking latest addonInstance configuration and seeing if it differs with current AddonInstance configuration
-			latestAddonInstanceConfiguration, err := utils.GetAddonInstanceConfiguration(ctx, mgr.GetClient(), addonName)
-			if err != nil {
-				return fmt.Errorf("failed to get the AddonInstance configuration corresponding to the Addon '%s': %w", addonName, err)
-			}
-			if !reflect.DeepEqual(currentAddonInstanceConfiguration, latestAddonInstanceConfiguration) {
-				currentAddonInstanceConfiguration = latestAddonInstanceConfiguration
-
-				// the following function can be absolutely anything depending how reference-addon would want to deal with AddonInstance's configuration change
-				handleConfigurationChanges := func(addonsv1alpha1.AddonInstanceSpec) {}
-				handleConfigurationChanges(currentAddonInstanceConfiguration)
-			}
-
-			// waiting for heartbeat update period for executing the next iteration
-			<-time.After(currentAddonInstanceConfiguration.HeartbeatUpdatePeriod.Duration)
-		}
-	}))
+	// setup the heartbeat reporter
+	heartbeatCommunicatorCh, err := utils.SetupHeartbeatReporter(mgr, addonName, handleAddonInstanceConfigurationChanges)
 	if err != nil {
 		setupLog.Error(err, "unable to setup heartbeat reporter")
 		os.Exit(1)
 	}
+	///////////////////////////////////////////////////// -------------------------------- /////////////////////////////////////////////////////
 
 	if err = (&controllers.ReferenceAddonReconciler{
 		Client:                       mgr.GetClient(),
 		Log:                          ctrl.Log.WithName("controllers").WithName("ReferenceAddon"),
 		Scheme:                       mgr.GetScheme(),
-		HeartbeatCommunicatorChannel: heartbeatCommunicatorCh,
+		HeartbeatCommunicatorChannel: heartbeatCommunicatorCh, // linking the heartbeat communicator channel with the reconciler
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ReferenceAddon")
 		os.Exit(1)
